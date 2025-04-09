@@ -10,6 +10,32 @@ from torch.utils.data import DataLoader
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+
+class Wav2Vec2BertForContrastiveLearning(nn.Module):
+    def __init__(self, model_name, pooling_mode='mean'):
+        super().__init__()
+        self.pooling_mode = pooling_mode
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+        self.wav2vec2bert = Wav2Vec2BertModel.from_pretrained(model_name)
+        self.config = self.wav2vec2bert.config
+
+    def merged_strategy(self, hidden_states, mode="mean"):
+        if mode == "mean":
+            outputs = torch.mean(hidden_states, dim=1)
+        elif mode == "sum":
+            outputs = torch.sum(hidden_states, dim=1)
+        elif mode == "max":
+            outputs = torch.max(hidden_states, dim=1)[0]
+        else:
+            raise Exception("The pooling method hasn't been defined! Your pooling mode must be one of these ['mean', 'sum', 'max']")
+        return outputs
+
+    def forward(self, input_features):
+        outputs = self.wav2vec2bert(input_features)
+        hidden_states = outputs.last_hidden_state
+        pooled = self.merged_strategy(hidden_states, mode=self.pooling_mode)
+        return pooled
+
 def compute_det_curve(target_scores, nontarget_scores):
     n_scores = target_scores.size + nontarget_scores.size
     all_scores = np.concatenate((target_scores, nontarget_scores))
