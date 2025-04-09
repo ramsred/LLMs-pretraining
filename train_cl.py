@@ -1,0 +1,682 @@
+import os
+import random
+import librosa
+import numpy as np
+import torch
+from tqdm import tqdm
+from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def compute_det_curve(target_scores, nontarget_scores):
+    n_scores = target_scores.size + nontarget_scores.size
+    all_scores = np.concatenate((target_scores, nontarget_scores))
+    labels = np.concatenate((np.ones(target_scores.size), np.zeros(nontarget_scores.size)))
+
+    # Sort labels based on scores
+    indices = np.argsort(all_scores, kind='mergesort')
+    labels = labels[indices]
+
+    # Compute false rejection and false acceptance rates
+    tar_trial_sums = np.cumsum(labels)
+    nontarget_trial_sums = nontarget_scores.size - (np.arange(1, n_scores + 1) - tar_trial_sums)
+
+    frr = np.concatenate((np.atleast_1d(0), tar_trial_sums / target_scores.size))  # false rejection rates
+    far = np.concatenate((np.atleast_1d(1), nontarget_trial_sums / nontarget_scores.size))  # false acceptance rates
+    thresholds = np.concatenate(
+        (np.atleast_1d(all_scores[indices[0]] - 0.001), all_scores[indices]))  # Thresholds are the sorted scores
+
+    return frr, far, thresholds
+
+def compute_eer(ground_truth, predictions):
+    """
+    Expecting ground_truth and predictions to be numpy arrays of the same length;
+    Defining deepfakes (ground_truth == 1) as target scores and bonafide (ground_truth == 0) as nontarget scores.
+    """
+    assert ground_truth.shape == predictions.shape, "ground_truth and predictions must have the same shape"
+    assert len(ground_truth.shape) == 1, "ground_truth and predictions must be 1D arrays"
+
+    target_scores = predictions[ground_truth == 1]
+    nontarget_scores = predictions[ground_truth == 0]
+
+    frr, far, thresholds = compute_det_curve(target_scores, nontarget_scores)
+    abs_diffs = np.abs(frr - far)
+    min_index = np.argmin(abs_diffs)
+    eer = np.mean((frr[min_index], far[min_index]))
+    return eer, thresholds[min_index]
+
+def run_validation(model, feature_extractor, data_loader, sr):
+
+    outputs_list = []
+    labels_list = []
+    train_loss = []
+    num_total = 0
+
+    model.eval()
+
+    with torch.no_grad():
+        for batch_x, batch_y, name in tqdm(data_loader, desc="Evaluating"):
+            batch_size = batch_x.size(0)
+            num_total += batch_size
+            batch_x = batch_x.numpy()
+            inputs = feature_extractor(batch_x, sampling_rate=sr, return_attention_mask=True, padding_value=0, return_tensors="pt").to(device)
+            batch_y = batch_y.to(device)
+            inputs['labels'] = batch_y
+            outputs = model(**inputs)
+            train_loss.append(outputs.loss.item())
+            batch_probs = outputs.logits.softmax(dim=-1)
+            batch_label = batch_y.detach().to('cpu').numpy().tolist()
+            outputs_list.extend(batch_probs[:, 1].tolist())
+            labels_list.extend(batch_label)
+
+        auroc = roc_auc_score(labels_list, outputs_list)
+        eer = compute_eer(np.array(labels_list), np.array(outputs_list))
+        preds = (np.array(outputs_list) > eer[1]).astype(int)
+        acc = np.mean(np.array(labels_list) == np.array(preds))
+        prec = precision_score(labels_list, preds)
+        recall = recall_score(labels_list, preds)
+        f1 = f1_score(labels_list, preds)
+        print(f'Validation Accuracy: {acc} \t F1: {f1} \t Precision: {prec} \t Recall: {recall}, AUROC: {auroc} \t EER: {eer}')
+        
+    return acc, auroc, eer
+
+def pad(x, max_len=64000):
+    x_len = x.shape[0]
+    if x_len >= max_len:
+        return x[:max_len]
+
+    pad_length = max_len - x_len
+    padded_x = np.concatenate([x, np.zeros(pad_length)], axis=0)
+    return padded_x
+
+
+def seed_worker(worker_id):
+    """
+    Used in generating seed for the worker of torch.utils.data.Dataloader
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+class AudioDataset(Dataset):
+    def __init__(self, list_IDs, labels, transform=False):
+        """self.list_IDs	: list of strings (each string: utt key),
+           self.labels      : dictionary (key: utt key, value: label integer)"""
+        self.list_IDs = list_IDs
+        self.labels = labels
+        self.cut = 64000
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.list_IDs)
+
+    def __getitem__(self, index):
+        key = self.list_IDs[index]
+        X, sr = librosa.load(str(key), sr=8000)
+        X = pad(X, max_len=self.cut)
+        y = self.labels[key]
+
+        return X, y, key
+
+
+class CombinedTripletDataset(Dataset):
+    def __init__(self, train_ids,train_labels, sr=16000, transform=None, seed=None):
+        super().__init__()
+        self.data_paths = data_paths
+        self.sr = sr
+        self.transform = transform
+
+
+        # Separate real/fake paths
+        self.real_paths = [path for path in train_ids if train_labels[path] == 1]
+        self.fake_paths = [path for path in train_ids if train_labels[path] == 0]
+        self.d_meta = train_labels  # if you want to do any lookups later
+
+        # The dataset length = number of real audio files
+        # because each anchor must be real
+        self.num_real = len(self.real_paths)
+
+    def __len__(self):
+        return self.num_real
+
+    def __getitem__(self, idx):
+        anchor_path = self.real_paths[idx]
+        anchor_waveform, sr = librosa.load(str(anchor_path), sr=8000)
+        anchor_waveform = pad(anchor_waveform, max_len=self.cut)
+        anchor_label = 1
+
+       
+
+        pos_path = random.choice(self.real_paths)
+        pos_waveform, sr = librosa.load(pos_path, sr=8000)
+        pos_label = 1
+
+        neg_path = random.choice(self.fake_paths)
+        neg_waveform, sr = librosa.load(neg_path, sr=8000)
+        neg_label = 0
+
+        return (anchor_waveform, anchor_label,
+                pos_waveform, pos_label,
+                neg_waveform, neg_label)
+
+
+def genIn_the_wild_list_new(database_path: str):
+
+    import csv
+    database_path = database_path
+    file = os.path.join(database_path, 'meta.csv')
+    d_meta = {}
+    file_list = []
+    data_list0 = []
+    data_list1 = []
+
+    with open(file, 'r') as f:
+        csv_reader = csv.reader(f)
+        next(csv_reader)
+        for line in csv_reader:
+            key, name, label = line
+    
+            if label == 'bona-fide':
+                data_list1.append(os.path.join(database_path,key))
+                d_meta[os.path.join(database_path, key)] = 1
+            else:
+                data_list0.append(os.path.join(database_path, key))
+                d_meta[os.path.join(database_path, key)] = 0
+    
+    file_list = data_list0 + data_list1
+    return d_meta, file_list
+
+def getASVSpoof2021_list_new(data_path):
+
+    d_meta = {}
+    file_list = []
+    file_path = os.path.join(data_path,'ASVspoof2021.LA.cm.eval.trl_updated.txt')
+    with open(file_path, "r") as f:
+        l_meta = f.readlines()
+        for line in l_meta:
+            _, key, _, _, label = line.strip().split(" ")
+            key = os.path.join(data_path,'flac', key + '.flac')
+            file_list.append(key)
+            d_meta[key] = 1 if label == "bonafide" else 0
+
+    return d_meta, file_list
+
+def getASVSpoof2019_list_new(data_path):
+    d_meta = {}
+    file_list = []
+
+    def read_meta_file(meta_file, audio_folder):
+        with open(meta_file, "r") as f:
+            l_meta = f.readlines()
+        for line in l_meta:
+            _, key, _, _, label = line.strip().split(" ")
+            key = os.path.join(audio_folder, key + '.flac')
+            file_list.append(key)
+            d_meta[key] = 1 if label == "bonafide" else 0
+
+    # Define the metadata files and corresponding audio folders for train, validation, and test sets
+    datasets = [
+        ('ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trl.txt', 'ASVspoof2019_LA_train/flac'),
+        ('ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.val.trl.txt', 'ASVspoof2019_LA_val/flac'),
+        ('ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.test.trl.txt', 'ASVspoof2019_LA_test/flac')
+    ]
+
+    # Loop through each dataset and read the metadata files
+    for meta_file, audio_folder in datasets:
+        meta_file_path = os.path.join(data_path, meta_file)
+        audio_folder_path = os.path.join(data_path, audio_folder)
+        read_meta_file(meta_file_path, audio_folder_path)
+
+    return d_meta, file_list
+
+def genLJSpeech_list_new(data_path):
+    d_meta = {}
+    data_list = []
+
+    # Get LJSpeech
+    real_datapath = os.path.join(data_path, 'wavs/')
+    file_list = os.listdir(real_datapath)
+
+    for line in file_list:
+        key = os.path.join(real_datapath, line)
+        data_list.append(key)
+        d_meta[key] = 1
+
+    return d_meta, data_list
+
+def genWavefake_list_new(data_path):
+    d_meta = {}
+    data_list0 = []
+    data_list1 = []
+
+    ## Get wavefake
+    folders = ['ljspeech_melgan',
+               'ljspeech_parallel_wavegan',
+               'ljspeech_multi_band_melgan',
+               'ljspeech_full_band_melgan',
+               'ljspeech_waveglow',
+               'ljspeech_hifiGAN']
+
+    for i in range(len(folders)):
+        file_list = os.listdir(os.path.join(data_path, folders[i]))
+        for line in file_list:
+            key = os.path.join(data_path, folders[i], line)
+            data_list0.append(key)
+            d_meta[key] = 0
+    return d_meta, data_list0
+
+
+def gen_for_norm_list_new(data_path):
+    def read_data(subfolder):
+        ids = []
+        d_meta = {}
+        categories = ['fake', 'real']
+
+        for category in categories:
+            folder_path = os.path.join(data_path, subfolder, category)
+            file_list = os.listdir(folder_path)
+            for file_name in file_list:
+                key = os.path.join(folder_path, file_name)
+                ids.append(key)
+                if category == 'fake':
+                    d_meta[key]=0
+                else:
+                    d_meta[key]=1
+        
+        return d_meta, ids
+
+    # Read each dataset separately
+    train_meta, train_ids = read_data('training')
+    val_meta, val_ids = read_data('validation')
+    test_meta, test_ids = read_data('testing')
+
+    return train_ids,train_meta,val_ids,val_meta,test_ids,test_meta
+
+
+def split_dict(file_dict, train_ratio=0.70, val_ratio=0.10, test_ratio=0.20, seed=None):
+    # Ensure the ratios sum to 1
+    assert train_ratio + val_ratio + test_ratio == 1.0, "Ratios must sum to 1"
+    
+    # Set the random seed for reproducibility
+    if seed is not None:
+        random.seed(seed)
+
+    # Separate filenames based on labels
+    label_1_files = [filename for filename, label in file_dict.items() if label == 1]
+    label_0_files = [filename for filename, label in file_dict.items() if label == 0]
+
+    # Shuffle the files
+    random.shuffle(label_1_files)
+    random.shuffle(label_0_files)
+
+    # Calculate the number of files for each split
+    num_label_1_files = len(label_1_files)
+    num_label_0_files = len(label_0_files)
+
+    train_size_1 = int(train_ratio * num_label_1_files)
+    val_size_1 = int(val_ratio * num_label_1_files)
+    test_size_1 = num_label_1_files - train_size_1 - val_size_1
+
+    train_size_0 = int(train_ratio * num_label_0_files)
+    val_size_0 = int(val_ratio * num_label_0_files)
+    test_size_0 = num_label_0_files - train_size_0 - val_size_0
+
+    # Split the files for label 1
+    train_files_1 = label_1_files[:train_size_1]
+    val_files_1 = label_1_files[train_size_1:train_size_1 + val_size_1]
+    test_files_1 = label_1_files[train_size_1 + val_size_1:]
+
+    # Split the files for label 0
+    train_files_0 = label_0_files[:train_size_0]
+    val_files_0 = label_0_files[train_size_0:train_size_0 + val_size_0]
+    test_files_0 = label_0_files[train_size_0 + val_size_0:]
+
+    # Combine label 1 and label 0 files for each split
+    train_files = train_files_1 + train_files_0
+    val_files = val_files_1 + val_files_0
+    test_files = test_files_1 + test_files_0
+
+    # Create the split dictionaries
+    train_dict = {filename: file_dict[filename] for filename in train_files}
+    val_dict = {filename: file_dict[filename] for filename in val_files}
+    test_dict = {filename: file_dict[filename] for filename in test_files}
+
+    return train_dict, val_dict, test_dict
+
+def combine_all_dicts(meta, train_labels, train_ids, val_labels, val_ids, test_labels, test_ids, seed=None):
+    train_dict, val_dict, test_dict = split_dict(meta, seed=seed)
+
+    # Shuffle the training, validation, and test sets
+    train_keys = list(train_dict.keys())
+    val_keys = list(val_dict.keys())0
+    test_keys = list(test_dict.keys())
+
+    if seed is not None:
+        random.seed(seed)
+
+    random.shuffle(train_keys)
+    random.shuffle(val_keys)
+    random.shuffle(test_keys)
+
+    train_ids += train_keys
+    val_ids += val_keys
+    test_ids += test_keys
+
+    train_labels.update(train_dict)
+    val_labels.update(val_dict)
+    test_labels.update(test_dict)
+
+    return train_labels, train_ids, val_labels, val_ids, test_labels, test_ids
+
+def gen_combined_list(data_paths, seed=None):
+    train_labels, val_labels, test_labels = {}, {}, {}
+    train_ids, val_ids, test_ids = [], [], []
+
+    for data_path in data_paths:
+        if data_path == "../data/in_the_wild/":
+            meta, data_list = genIn_the_wild_list_new(data_path)
+            train_labels, train_ids, val_labels, val_ids, test_labels, test_ids = \
+                combine_all_dicts(meta, train_labels, train_ids, val_labels, val_ids, test_labels, test_ids, seed)
+        elif data_path == "../data/ASVspoof2021_LA_eval/":
+            meta, data_list = getASVSpoof2021_list_new(data_path)
+            train_labels, train_ids, val_labels, val_ids, test_labels, test_ids = \
+                combine_all_dicts(meta, train_labels, train_ids, val_labels, val_ids, test_labels, test_ids, seed)
+        elif data_path == "../data/wavefake/":
+            meta, data_list = genWavefake_list_new(data_path)
+            train_labels, train_ids, val_labels, val_ids, test_labels, test_ids = \
+                combine_all_dicts(meta, train_labels, train_ids, val_labels, val_ids, test_labels, test_ids, seed)
+        elif data_path == "../data/LJSpeech-1.1/":
+            meta, data_list = genLJSpeech_list_new(data_path)
+            train_labels, train_ids, val_labels, val_ids, test_labels, test_ids = \
+                combine_all_dicts(meta, train_labels, train_ids, val_labels, val_ids, test_labels, test_ids, seed)
+        elif data_path =="../data/for-norm/":
+        
+            train_keys,train_meta,val_keys,val_meta,test_keys,test_meta = gen_for_norm_list_new(data_path)
+            train_ids += train_keys
+            val_ids += val_keys
+            test_ids += test_keys
+
+            train_labels.update(train_meta)
+            val_labels.update(val_meta)
+            test_labels.update(test_meta)
+        elif data_path =="../data/for-rerecorded/":
+            train_keys,train_meta,val_keys,val_meta,test_keys,test_meta = gen_for_norm_list_new(data_path)
+            train_ids += train_keys
+            val_ids += val_keys
+            test_ids += test_keys
+
+            train_labels.update(train_meta)
+            val_labels.update(val_meta)
+            test_labels.update(test_meta)
+
+        elif data_path =="../data/ASVspoof2019_LA/":
+            meta, data_list = getASVSpoof2019_list_new(data_path)
+            train_labels, train_ids, val_labels, val_ids, test_labels, test_ids = \
+                combine_all_dicts(meta, train_labels, train_ids, val_labels, val_ids, test_labels, test_ids, seed)
+        else:
+            print("Data path not found.")
+            
+    return train_labels, train_ids, val_labels, val_ids, test_labels, test_ids
+
+def get_combined_loader(database_path_list: str, seed: int, batch_size: int):
+    train_labels, train_ids, val_labels, val_ids, test_labels, test_ids = gen_combined_list(database_path_list,seed)
+ 
+    # Create instances of the AudioDataset
+    train_dataset = AudioDataset(train_ids, train_labels)
+    val_dataset = AudioDataset(val_ids, val_labels)
+    test_dataset = AudioDataset(test_ids, test_labels)
+
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+
+    # Create the training DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
+
+    # Create the validation DataLoader
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
+
+    # Create the test DataLoader
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
+
+    return train_loader, val_loader, test_loader
+
+
+def get_combined_loader_cl(database_path_list: str, seed: int, batch_size: int):
+    train_labels, train_ids, val_labels, val_ids, test_labels, test_ids = gen_combined_list(database_path_list, seed)
+
+    # Create instances of the CombinedTripletDataset
+    train_dataset = CombinedTripletDataset(train_ids, train_labels)
+    val_dataset = CombinedTripletDataset(val_ids, val_labels)
+    test_dataset = CombinedTripletDataset(test_ids, test_labels)
+
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+
+    # Create the training DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
+    # Create the validation DataLoader
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
+    # Create the test DataLoader
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
+
+    return train_loader, val_loader, test_loader
+
+def get_generator(test_ids,test_labels,seed:int,batch_size:int):
+     # Create instances of the AudioDataset
+    test_dataset = AudioDataset(test_ids, test_labels)
+
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+   
+    # Create the test DataLoader
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
+    return test_loader
+
+def get_test_loader(data_paths: str, seed: int, batch_size: int):
+    test_labels = {}
+    test_ids = []
+    test_loader = None
+    for data_path in data_paths:
+        if data_path == "../data/in_the_wild/":
+            meta, data_list = genIn_the_wild_list_new(data_path)
+            test_labels = test_labels | meta
+            test_ids += data_list
+           
+        elif data_path == "../data/ASVspoof2021_LA_eval/":
+            meta, data_list = getASVSpoof2021_list_new(data_path)
+            test_labels = test_labels | meta
+            test_ids += data_list
+
+        elif data_path == "../data/wavefake/":
+            meta_0, data_list0 = genWavefake_list_new(data_path)
+            test_labels = test_labels | meta_0
+            test_ids += data_list0
+            
+        elif data_path == "../data/LJSpeech-1.1/" :
+            meta_1, data_list1 = genLJSpeech_list_new(data_path)
+            test_labels = test_labels | meta_1
+            test_ids += data_list1
+            
+        elif data_path =="../data/for-norm/":
+            meta, data_list = gen_for_norm_list(data_path)
+            test_labels = test_labels | meta
+            test_ids += data_list
+ 
+        elif data_path =="../data/for-rerecorded/":
+            meta, data_list = gen_for_norm_list(data_path)
+            test_labels = test_labels | meta
+            test_ids += data_list
+    
+        elif data_path =="../data/ASVspoof2019_LA/":
+            meta, data_list = getASVSpoof2019_list_new(data_path)
+            test_labels = test_labels | meta
+            test_ids += data_list
+            
+        else:
+            print("Data path not found.")
+ 
+    test_loader = get_generator(test_ids,test_labels,seed,batch_size)
+    return test_loader
+
+
+
+import argparse
+import sys
+import os
+import numpy as np
+from tqdm import tqdm
+import random
+import librosa
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoFeatureExtractor, Wav2Vec2BertModel
+from sklearn.metrics import roc_auc_score
+from collections import defaultdict, Counter
+from datetime import datetime
+from models.wave2vec2bert import Wav2Vec2BertForContrastiveLearning
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def run_validation(model, val_loader):
+    model.eval()
+    val_loss = 0.0
+    total_samples = 0
+    triplet_loss_fn = nn.TripletMarginLoss(margin=1.0, p=2)
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            anchor_wavs, anchor_labels, pos_wavs, pos_labels, neg_wavs, neg_labels = batch
+
+            anchor_wavs = anchor_wavs.to(device)
+            pos_wavs = pos_wavs.to(device)
+            neg_wavs = neg_wavs.to(device)
+
+            anchor_emb = model(anchor_wavs)
+            pos_emb = model(pos_wavs)
+            neg_emb = model(neg_wavs)
+
+            loss_triplet = triplet_loss_fn(anchor_emb, pos_emb, neg_emb)
+
+            bs = anchor_wavs.size(0)
+            val_loss += loss_triplet.item() * bs
+            total_samples += bs
+            
+    avg_loss = val_loss / total_samples if total_samples else 0
+    print(f"[INFO] Validation - Avg Loss: {avg_loss:.4f}")
+    model.train()  # Set the model back to training mode
+
+def main(args):
+    seed = args.seed
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+    output_dir = args.output_dir
+    eval_ckpt = os.path.join(output_dir, "eval")
+
+    pretrained_model_name = args.pretrained_model_name
+    if pretrained_model_name == 'wave2vec2bert':
+        model_name = "facebook/w2v-bert-2.0"
+        model = Wav2Vec2BertHybrid(model_name)
+        sampling_rate = 16000
+    else:
+        raise ValueError(f"Model {pretrained_model_name} not supported")
+        sys.exit(0)
+
+    model = model.to(device)
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+
+    for name, param in model.named_parameters():
+        print(f"{name}: {param.numel()} parameters, trainable={param.requires_grad}")
+
+    if args.eval:
+        in_the_wild_loader = get_in_the_wild_loader(args.data_path, seed=seed, batch_size=args.batch_size)
+        print(f"Start evaluating In-the-wild using {device}")
+        run_validation(model, in_the_wild_loader)
+        print('Evaluation finished')
+        sys.exit(0)
+
+    if args.train:
+        print(f"Start Finetuning using {device}")
+        torch.cuda.empty_cache()
+        database_path_list = args.data_path
+        print(database_path_list)
+        trn_loader, val_loader, test_loader = get_combined_loader_cl(database_path_list, seed, args.batch_size)
+        optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        model.train()
+        for epoch in range(args.epochs):
+            print(f'{output_dir}/{args.dataset_name}_{pretrained_model_name}_epoch_{epoch}_{args.lr}_{datetime.now()}.pth')
+            total_loss, num_total, steps = 0.0, 0, 0
+
+            for batch in tqdm(trn_loader, desc="Finetuning"):
+                anchor_wavs, anchor_labels, pos_wavs, pos_labels, neg_wavs, neg_labels = batch
+                num_total += anchor_wavs.size(0)
+                steps += 1
+
+                anchor_wavs = anchor_wavs.to(device)
+                pos_wavs = pos_wavs.to(device)
+                neg_wavs = neg_wavs.to(device)
+
+                optim.zero_grad()
+
+                anchor_emb = model(anchor_wavs)
+                pos_emb = model(pos_wavs)
+                neg_emb = model(neg_wavs)
+
+                loss_triplet = nn.TripletMarginLoss(margin=args.margin)(anchor_emb, pos_emb, neg_emb)
+                loss_triplet.backward()
+                optim.step()
+
+                total_loss += loss_triplet.item() * anchor_wavs.size(0)
+
+                if steps % 100 == 0:
+                    print(f"Epoch [{epoch+1}/{args.epochs}] Step [{steps}], Loss: {loss_triplet.item():.4f}")
+
+                if steps % args.eval_steps == 0:
+                    run_validation(model, val_loader)
+                    model.train()
+
+            avg_loss = total_loss / num_total if num_total else 0
+            print(f"Epoch [{epoch+1}/{args.epochs}] - Avg Loss: {avg_loss:.4f}")
+
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(model.state_dict(), f'{output_dir}/{args.dataset_name}_{pretrained_model_name}_epoch_{epoch}_{args.lr}_{datetime.now()}.pth')
+            torch.cuda.empty_cache()
+        print(f'Finetuning with combined {args.dataset_name} finished')
+        sys.exit(0)
+
+    if args.test:
+        for database_path_list in [args.data_path]:
+            dataset_name = database_path_list
+            test_loader = get_test_loader(database_path_list, seed, args.batch_size)
+            checkpoint_list = [args.checkpoint]
+            for checkpoint_name in checkpoint_list:
+                print(f"Start testing with:{dataset_name}_checkpoint:{checkpoint_name} {device}")
+                model_path = os.path.join(output_dir, checkpoint_name)
+                model.load_state_dict(torch.load(model_path, map_location=device))
+                model.eval()
+                run_validation(model, test_loader)
+                print('Evaluation finished')
+        sys.exit(0)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train, evaluate, and test a Wav2Vec2BERT model.")
+    parser.add_argument("--seed", type=int, default=1234, help="Random seed for reproducibility")
+    parser.add_argument("--output_dir", type=str, default="./ckpt", help="Directory to save checkpoints and outputs")
+    parser.add_argument("--pretrained_model_name", type=str, default="wave2vec2bert", help="Name of the pretrained model")
+    parser.add_argument("--data_path", type=str, nargs='+', required=True, help="List of paths to the training data")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training and evaluation")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate for the optimizer")
+    parser.add_argument("--weight_decay", type=float, default=5e-5, help="Weight decay for the optimizer")
+    parser.add_argument("--eval_steps", type=int, default=1000, help="Number of steps between evaluations")
+    parser.add_argument("--dataset_name", type=str, default="dataset", help="Name of the dataset")
+    parser.add_argument("--checkpoint", type=str, default="", help="Checkpoint file for testing")
+    parser.add_argument("--train", type=bool, default=False, help="Flag to run training")
+    parser.add_argument("--eval", type=bool, default=False, help="Flag to run evaluation")
+    parser.addendant("--test", type=bool, default=False, help="Flag to run testing")
+
+    args = parser.parse_args()
+    main(args)
