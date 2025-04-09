@@ -7,14 +7,16 @@ from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class Wav2Vec2BertForContrastiveLearning(nn.Module):
-    def __init__(self, model_name, pooling_mode='mean'):
+    def __init__(self, model_name, pooling_mode='mean', normalize_embeddings=True):
         super().__init__()
         self.pooling_mode = pooling_mode
+        self.normalize_embeddings = normalize_embeddings
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
         self.wav2vec2bert = Wav2Vec2BertModel.from_pretrained(model_name)
         self.config = self.wav2vec2bert.config
@@ -25,17 +27,35 @@ class Wav2Vec2BertForContrastiveLearning(nn.Module):
         elif mode == "sum":
             outputs = torch.sum(hidden_states, dim=1)
         elif mode == "max":
-            outputs = torch.max(hidden_states, dim=1)[0]
+            outputs, _ = torch.max(hidden_states, dim=1)
         else:
-            raise Exception("The pooling method hasn't been defined! Your pooling mode must be one of these ['mean', 'sum', 'max']")
+            raise ValueError(
+                f"Undefined pooling mode: '{mode}'. Choose from ['mean', 'sum', 'max']."
+            )
         return outputs
+
+    def preprocess_audio(self, audio_waveforms, sampling_rate=16000):
+        """
+        Helper function to preprocess raw audio waveforms directly.
+        This method converts raw audio to features expected by Wav2Vec2BERT.
+        """
+        inputs = self.feature_extractor(
+            audio_waveforms, 
+            sampling_rate=sampling_rate, 
+            return_tensors="pt", 
+            padding=True
+        )
+        return inputs['input_values']
 
     def forward(self, input_features):
         outputs = self.wav2vec2bert(input_features)
         hidden_states = outputs.last_hidden_state
-        pooled = self.merged_strategy(hidden_states, mode=self.pooling_mode)
-        return pooled
+        embeddings = self.merged_strategy(hidden_states, mode=self.pooling_mode)
 
+        if self.normalize_embeddings:
+            embeddings = F.normalize(embeddings, p=2, dim=1)  # Essential for triplet loss stability
+
+        return embeddings
 def compute_det_curve(target_scores, nontarget_scores):
     n_scores = target_scores.size + nontarget_scores.size
     all_scores = np.concatenate((target_scores, nontarget_scores))
@@ -148,44 +168,47 @@ class AudioDataset(Dataset):
 
 
 class CombinedTripletDataset(Dataset):
-    def __init__(self, train_ids,train_labels, sr=16000, transform=None, seed=None):
+    def __init__(self, train_ids, train_labels, sr=16000, max_len=64000):
         super().__init__()
-        self.data_paths = data_paths
         self.sr = sr
-        self.transform = transform
-
-
+        self.max_len = max_len
+        
         # Separate real/fake paths
         self.real_paths = [path for path in train_ids if train_labels[path] == 1]
         self.fake_paths = [path for path in train_ids if train_labels[path] == 0]
-        self.d_meta = train_labels  # if you want to do any lookups later
-
-        # The dataset length = number of real audio files
-        # because each anchor must be real
-        self.num_real = len(self.real_paths)
 
     def __len__(self):
-        return self.num_real
+        return len(self.real_paths)
+
+    def pad(self, x):
+        if len(x) >= self.max_len:
+            return x[:self.max_len]
+        else:
+            pad_len = self.max_len - len(x)
+            return np.concatenate([x, np.zeros(pad_len)])
 
     def __getitem__(self, idx):
         anchor_path = self.real_paths[idx]
-        anchor_waveform, sr = librosa.load(str(anchor_path), sr=8000)
-        anchor_waveform = pad(anchor_waveform, max_len=self.cut)
-        anchor_label = 1
+        anchor_waveform, _ = librosa.load(anchor_path, sr=self.sr)
+        anchor_waveform = self.pad(anchor_waveform)
 
-       
-
+        # Positive sample (ensure it's different from anchor)
         pos_path = random.choice(self.real_paths)
-        pos_waveform, sr = librosa.load(pos_path, sr=8000)
-        pos_label = 1
+        while pos_path == anchor_path:
+            pos_path = random.choice(self.real_paths)
+        pos_waveform, _ = librosa.load(pos_path, sr=self.sr)
+        pos_waveform = self.pad(pos_waveform)
 
+        # Negative sample
         neg_path = random.choice(self.fake_paths)
-        neg_waveform, sr = librosa.load(neg_path, sr=8000)
-        neg_label = 0
+        neg_waveform, _ = librosa.load(neg_path, sr=self.sr)
+        neg_waveform = self.pad(neg_waveform)
 
-        return (anchor_waveform, anchor_label,
-                pos_waveform, pos_label,
-                neg_waveform, neg_label)
+        return (
+            torch.tensor(anchor_waveform, dtype=torch.float32),
+            torch.tensor(pos_waveform, dtype=torch.float32),
+            torch.tensor(neg_waveform, dtype=torch.float32)
+        )
 
 
 def genIn_the_wild_list_new(database_path: str):
@@ -469,23 +492,27 @@ def get_combined_loader(database_path_list: str, seed: int, batch_size: int):
     return train_loader, val_loader, test_loader
 
 
-def get_combined_loader_cl(database_path_list: str, seed: int, batch_size: int):
+def get_combined_loader_cl(database_path_list, seed, batch_size):
     train_labels, train_ids, val_labels, val_ids, test_labels, test_ids = gen_combined_list(database_path_list, seed)
 
-    # Create instances of the CombinedTripletDataset
     train_dataset = CombinedTripletDataset(train_ids, train_labels)
     val_dataset = CombinedTripletDataset(val_ids, val_labels)
     test_dataset = CombinedTripletDataset(test_ids, test_labels)
 
-    gen = torch.Generator()
-    gen.manual_seed(seed)
+    gen = torch.Generator().manual_seed(seed)
 
-    # Create the training DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
-    # Create the validation DataLoader
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
-    # Create the test DataLoader
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=gen)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        worker_init_fn=seed_worker, generator=gen, drop_last=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        worker_init_fn=seed_worker, generator=gen, drop_last=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        worker_init_fn=seed_worker, generator=gen, drop_last=True
+    )
 
     return train_loader, val_loader, test_loader
 
@@ -548,161 +575,141 @@ def get_test_loader(data_paths: str, seed: int, batch_size: int):
 
 
 
-import argparse
-import sys
-import os
-import numpy as np
-from tqdm import tqdm
-import random
-import librosa
 import torch
-from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+from tqdm import tqdm
 from transformers import AutoFeatureExtractor, Wav2Vec2BertModel
-from sklearn.metrics import roc_auc_score
-from collections import defaultdict, Counter
+import os
 from datetime import datetime
+import argparse
 from models.wave2vec2bert import Wav2Vec2BertForContrastiveLearning
+from data_utils import get_combined_loader_cl
+import numpy as np
+import random
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def run_validation(model, val_loader):
+def run_validation(model, val_loader, feature_extractor, sampling_rate=16000):
     model.eval()
     val_loss = 0.0
-    total_samples = 0
-    triplet_loss_fn = nn.TripletMarginLoss(margin=1.0, p=2)
-    
+    criterion = nn.TripletMarginLoss(margin=1.0)
+
     with torch.no_grad():
-        for batch in val_loader:
-            anchor_wavs, anchor_labels, pos_wavs, pos_labels, neg_wavs, neg_labels = batch
+        for anchor_wave, pos_wave, neg_wave in val_loader:
 
-            anchor_wavs = anchor_wavs.to(device)
-            pos_wavs = pos_wavs.to(device)
-            neg_wavs = neg_wavs.to(device)
-
-            anchor_emb = model(anchor_wavs)
-            pos_emb = model(pos_wavs)
-            neg_emb = model(neg_wavs)
-
-            loss_triplet = triplet_loss_fn(anchor_emb, pos_emb, neg_emb)
-
-            bs = anchor_wavs.size(0)
-            val_loss += loss_triplet.item() * bs
-            total_samples += bs
+            # Preprocess inputs
+            # anchor_inputs = feature_extractor(anchor_wave.numpy(), sampling_rate=sampling_rate, return_tensors="pt", padding=True).input_values.to(device)
+            # pos_inputs = feature_extractor(pos_wave.numpy(), sampling_rate=sampling_rate, return_tensors="pt", padding=True).input_values.to(device)
+            # neg_inputs = feature_extractor(neg_wave.numpy(), sampling_rate=sampling_rate, return_tensors="pt", padding=True).input_values.to(device)
             
-    avg_loss = val_loss / total_samples if total_samples else 0
-    print(f"[INFO] Validation - Avg Loss: {avg_loss:.4f}")
-    model.train()  # Set the model back to training mode
+            anchor_inputs = feature_extractor(
+                anchor_wave.numpy(), 
+                sampling_rate=sampling_rate, 
+                return_tensors="pt", 
+                padding=True
+            ).input_features.to(device)
+
+            pos_inputs = feature_extractor(
+                pos_wave.numpy(), 
+                sampling_rate=sampling_rate, 
+                return_tensors="pt", 
+                padding=True
+            ).input_features.to(device)
+
+            neg_inputs = feature_extractor(
+                neg_wave.numpy(), 
+                sampling_rate=sampling_rate, 
+                return_tensors="pt", 
+                padding=True
+            ).input_features.to(device)
+
+            anchor_emb = model(anchor_inputs)
+            pos_emb = model(pos_inputs)
+            neg_emb = model(neg_inputs)
+
+            loss = criterion(anchor_emb, pos_emb, neg_emb)
+            val_loss += loss.item() * anchor_wave.size(0)
+
+    avg_loss = val_loss / len(val_loader.dataset)
+    print(f"[Validation] Avg Loss: {avg_loss:.4f}")
+    model.train()
+
+def train(model, trn_loader, val_loader, epochs, lr, weight_decay, eval_steps, output_dir, dataset_name, pretrained_model_name, sampling_rate=16000):
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.TripletMarginLoss(margin=1.0)
+
+    model.train()
+    feature_extractor = AutoFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+
+    for epoch in range(epochs):
+        epoch_loss, num_total = 0.0, 0
+
+        for step, (anchor_wave, pos_wave, neg_wave) in enumerate(tqdm(trn_loader, desc=f"Epoch {epoch+1}/{epochs}")):
+
+            anchor_inputs = feature_extractor(anchor_wave.numpy(), sampling_rate=sampling_rate, return_tensors="pt", padding=True).input_features.to(device)
+            pos_inputs = feature_extractor(pos_wave.numpy(), sampling_rate=sampling_rate, return_tensors="pt", padding=True).input_features.to(device)
+            neg_inputs = feature_extractor(neg_wave.numpy(), sampling_rate=sampling_rate, return_tensors="pt", padding=True).input_features.to(device)
+
+            optim.zero_grad()
+
+            anchor_emb = model(anchor_inputs)
+            pos_emb = model(pos_inputs)
+            neg_emb = model(neg_inputs)
+
+            loss = criterion(anchor_emb, pos_emb, neg_emb)
+            loss.backward()
+            optim.step()
+
+            epoch_loss += loss.item() * anchor_wave.size(0)
+            num_total += anchor_wave.size(0)
+
+            if (step + 1) % eval_steps == 0:
+                print(f"[Epoch {epoch+1}, Step {step+1}] Loss: {loss.item():.4f}")
+                run_validation(model, val_loader, feature_extractor, sampling_rate)
+
+        avg_epoch_loss = epoch_loss / num_total
+        print(f"[Epoch {epoch+1}] Avg Loss: {avg_epoch_loss:.4f}")
+
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ckpt_path = os.path.join(
+            output_dir,
+            f'{dataset_name}_{pretrained_model_name}_epoch_{epoch+1}_{timestamp}.pth'
+        )
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"Checkpoint saved: {ckpt_path}")
+
 
 def main(args):
-    seed = args.seed
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
-    output_dir = args.output_dir
-    eval_ckpt = os.path.join(output_dir, "eval")
-
-    pretrained_model_name = args.pretrained_model_name
-    if pretrained_model_name == 'wave2vec2bert':
+    if args.pretrained_model_name == 'wave2vec2bert':
         model_name = "facebook/w2v-bert-2.0"
-        model = Wav2Vec2BertHybrid(model_name)
-        sampling_rate = 16000
+        model = Wav2Vec2BertForContrastiveLearning(model_name).to(device)
     else:
-        raise ValueError(f"Model {pretrained_model_name} not supported")
-        sys.exit(0)
+        raise ValueError(f"Model {args.pretrained_model_name} not supported")
 
-    model = model.to(device)
     feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
 
-    for name, param in model.named_parameters():
-        print(f"{name}: {param.numel()} parameters, trainable={param.requires_grad}")
-
-    if args.eval:
-        in_the_wild_loader = get_in_the_wild_loader(args.data_path, seed=seed, batch_size=args.batch_size)
-        print(f"Start evaluating In-the-wild using {device}")
-        run_validation(model, in_the_wild_loader)
-        print('Evaluation finished')
-        sys.exit(0)
-
     if args.train:
-        print(f"Start Finetuning using {device}")
-        torch.cuda.empty_cache()
-        database_path_list = args.data_path
-        print(database_path_list)
-        trn_loader, val_loader, test_loader = get_combined_loader_cl(database_path_list, seed, args.batch_size)
-        optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        model.train()
-        for epoch in range(args.epochs):
-            print(f'{output_dir}/{args.dataset_name}_{pretrained_model_name}_epoch_{epoch}_{args.lr}_{datetime.now()}.pth')
-            total_loss, num_total, steps = 0.0, 0, 0
-
-            for batch in tqdm(trn_loader, desc="Finetuning"):
-                anchor_wavs, anchor_labels, pos_wavs, pos_labels, neg_wavs, neg_labels = batch
-                num_total += anchor_wavs.size(0)
-                steps += 1
-
-                anchor_wavs = anchor_wavs.to(device)
-                pos_wavs = pos_wavs.to(device)
-                neg_wavs = neg_wavs.to(device)
-
-                optim.zero_grad()
-
-                anchor_emb = model(anchor_wavs)
-                pos_emb = model(pos_wavs)
-                neg_emb = model(neg_wavs)
-
-                loss_triplet = nn.TripletMarginLoss(margin=args.margin)(anchor_emb, pos_emb, neg_emb)
-                loss_triplet.backward()
-                optim.step()
-
-                total_loss += loss_triplet.item() * anchor_wavs.size(0)
-
-                if steps % 100 == 0:
-                    print(f"Epoch [{epoch+1}/{args.epochs}] Step [{steps}], Loss: {loss_triplet.item():.4f}")
-
-                if steps % args.eval_steps == 0:
-                    run_validation(model, val_loader)
-                    model.train()
-
-            avg_loss = total_loss / num_total if num_total else 0
-            print(f"Epoch [{epoch+1}/{args.epochs}] - Avg Loss: {avg_loss:.4f}")
-
-            os.makedirs(output_dir, exist_ok=True)
-            torch.save(model.state_dict(), f'{output_dir}/{args.dataset_name}_{pretrained_model_name}_epoch_{epoch}_{args.lr}_{datetime.now()}.pth')
-            torch.cuda.empty_cache()
-        print(f'Finetuning with combined {args.dataset_name} finished')
-        sys.exit(0)
-
-    if args.test:
-        for database_path_list in [args.data_path]:
-            dataset_name = database_path_list
-            test_loader = get_test_loader(database_path_list, seed, args.batch_size)
-            checkpoint_list = [args.checkpoint]
-            for checkpoint_name in checkpoint_list:
-                print(f"Start testing with:{dataset_name}_checkpoint:{checkpoint_name} {device}")
-                model_path = os.path.join(output_dir, checkpoint_name)
-                model.load_state_dict(torch.load(model_path, map_location=device))
-                model.eval()
-                run_validation(model, test_loader)
-                print('Evaluation finished')
-        sys.exit(0)
+        train_loader, val_loader, _ = get_combined_loader_cl(args.data_path, args.seed, args.batch_size)
+        train(model, train_loader, val_loader, args.epochs, args.lr, args.weight_decay, args.eval_steps, args.output_dir, args.dataset_name, args.pretrained_model_name)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train, evaluate, and test a Wav2Vec2BERT model.")
-    parser.add_argument("--seed", type=int, default=1234, help="Random seed for reproducibility")
-    parser.add_argument("--output_dir", type=str, default="./ckpt", help="Directory to save checkpoints and outputs")
-    parser.add_argument("--pretrained_model_name", type=str, default="wave2vec2bert", help="Name of the pretrained model")
-    parser.add_argument("--data_path", type=str, nargs='+', required=True, help="List of paths to the training data")
-    parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training and evaluation")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate for the optimizer")
-    parser.add_argument("--weight_decay", type=float, default=5e-5, help="Weight decay for the optimizer")
-    parser.add_argument("--eval_steps", type=int, default=1000, help="Number of steps between evaluations")
-    parser.add_argument("--dataset_name", type=str, default="dataset", help="Name of the dataset")
-    parser.add_argument("--checkpoint", type=str, default="", help="Checkpoint file for testing")
-    parser.add_argument("--train", type=bool, default=False, help="Flag to run training")
-    parser.add_argument("--eval", type=bool, default=False, help="Flag to run evaluation")
-    parser.addendant("--test", type=bool, default=False, help="Flag to run testing")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--output_dir", type=str, default="./ckpt")
+    parser.add_argument("--pretrained_model_name", type=str, default="wave2vec2bert")
+    parser.add_argument("--data_path", type=str, nargs='+', required=True)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--weight_decay", type=float, default=5e-5)
+    parser.add_argument("--eval_steps", type=int, default=100)
+    parser.add_argument("--dataset_name", type=str, default="dataset")
+    parser.add_argument("--train", default='False')
 
     args = parser.parse_args()
     main(args)
