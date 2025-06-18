@@ -1,14 +1,12 @@
-# data_utils_speaker.py — ALL generators now emit label+speaker
-# ------------------------------------------------------------
-# 1. Every meta dict entry:   {"label": 0/1, "speaker": str}
-# 2. AudioDataset returns (wave, label, speaker_idx, key)
-# 3. split_dict & helpers reference meta[k]["label"]
-# 4. Generator functions for *all* datasets filled in with speaker ID logic
-# ------------------------------------------------------------
+# data_utils_speaker.py — ASVspoof speaker = numeric index (e.g. 79)
+# -----------------------------------------------------------------------------
+#  Change: in _parse_asvspoof_proto we now strip the 'LA_' prefix and leading
+#  zeros so the stored speaker tag becomes the plain integer string, e.g. 79.
+# -----------------------------------------------------------------------------
 
 import os, random, csv, librosa, numpy as np, torch
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import Dataset, DataLoader
 
 # ---------------- Device ----------------
@@ -18,30 +16,25 @@ device = (
         "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
 )
 
-# ---------------- Speaker fallback util ----------------
+# ---------------- Speaker helpers ----------------
 
 def extract_spk(path: str):
     base = os.path.basename(path)
-    if "_" in base:
-        return base.split("_")[0]
-    if "-" in base:
-        return base.split("-")[0]
+    if "_" in base: return base.split("_")[0]
+    if "-" in base: return base.split("-")[0]
     return "single"
-def seed_worker(worker_id):
-    """
-    Used in generating seed for the worker of torch.utils.data.Dataloader
-    """
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-# ---------------- EER helpers (unchanged) --------------
+
+def seed_worker(w_id):
+    seed = torch.initial_seed() % 2**32
+    random.seed(seed); np.random.seed(seed)
+
+# ---------------- Eval metrics -------------------
 
 def compute_det_curve(tar, non):
     n = tar.size + non.size
     scores = np.concatenate((tar, non))
     labels = np.concatenate((np.ones(tar.size), np.zeros(non.size)))
-    idx = np.argsort(scores, kind="mergesort")
-    labels = labels[idx]
+    idx = np.argsort(scores, kind="mergesort"); labels = labels[idx]
     tar_cum = np.cumsum(labels)
     non_cum = non.size - (np.arange(1, n+1) - tar_cum)
     frr = np.concatenate(([0], tar_cum / tar.size))
@@ -55,7 +48,7 @@ def compute_eer(gt, pr):
     i = np.argmin(np.abs(frr-far))
     return (frr[i]+far[i])/2, thr[i]
 
-# ---------------- Validation ---------------------------
+# ---------------- Validation ---------------------
 
 def run_validation(model, fx, loader, sr):
     outs, gts = [], []
@@ -64,24 +57,22 @@ def run_validation(model, fx, loader, sr):
         for wav, y, _, _ in tqdm(loader, desc="Valid"):
             inp = fx(wav.numpy(), sampling_rate=sr, return_attention_mask=True,
                      padding_value=0, return_tensors="pt").to(device)
-            logits = model(**inp).logits
-            outs.extend(logits.softmax(-1)[:,1].cpu().tolist())
+            outs.extend(model(**inp).logits.softmax(-1)[:,1].cpu().tolist())
             gts.extend(y.tolist())
     auroc = roc_auc_score(gts, outs)
     eer, thr = compute_eer(np.array(gts), np.array(outs))
-    preds = (np.array(outs) > thr).astype(int)
-    acc  = (preds == np.array(gts)).mean()
+    acc = ( (np.array(outs)>thr).astype(int) == np.array(gts) ).mean()
     print(f"VAL  Acc={acc:.3f}  AUROC={auroc:.3f}  EER={eer:.3f}")
-    return acc, auroc, (eer, thr)
+    return acc, auroc, (eer,thr)
 
-# ---------------- Pad helper ---------------------------
+# ---------------- Pad -----------------------------
 
-def pad(x, max_len=64000):
-    return x[:max_len] if len(x)>=max_len else np.concatenate([x, np.zeros(max_len-len(x))])
+def pad(x,l=64000):
+    return x[:l] if len(x)>=l else np.concatenate([x,np.zeros(l-len(x))])
 
-# ---------------- AudioDataset -------------------------
+# ---------------- Dataset -------------------------
 class AudioDataset(Dataset):
-    spk2idx = {}
+    spk2idx={}
     def __init__(self, ids, meta, cut=64000):
         self.ids, self.meta, self.cut = ids, meta, cut
         for k in ids:
@@ -90,88 +81,109 @@ class AudioDataset(Dataset):
                 AudioDataset.spk2idx[spk] = len(AudioDataset.spk2idx)
     def __len__(self): return len(self.ids)
     def __getitem__(self, idx):
-        key = self.ids[idx]
-        x,_ = librosa.load(key, sr=8000); x = pad(x, self.cut)
-        lab = self.meta[key]["label"]
-        spk = AudioDataset.spk2idx[self.meta[key]["speaker"]]
-        return x, lab, spk, key
+        key=self.ids[idx]
+        x,_=librosa.load(key,sr=8000); x=pad(x,self.cut)
+        y=self.meta[key]["label"]
+        spk=AudioDataset.spk2idx[self.meta[key]["speaker"]]
+        return x,y,spk,key
 
-# ---------------- Dataset-specific generators ----------
+# ---------------- Generators -----------------------
 
 def genIn_the_wild_list_new(base):
-    meta, lst = {}, []
-    with open(os.path.join(base, "meta.csv")) as f:
-        rdr = csv.DictReader(f)
+    meta,lst={},[]
+    with open(os.path.join(base,"meta.csv")) as f:
+        rdr=csv.DictReader(f)
         for r in rdr:
-            key = os.path.join(base, r["file"])
-            lab = 1 if r["label"]=="bona-fide" else 0
-            spk = r.get("speaker", extract_spk(key))
-            meta[key] = {"label": lab, "speaker": spk}; lst.append(key)
-    return meta, lst
+            key=os.path.join(base,r["file"])
+            meta[key]={"label":1 if r["label"]=="bona-fide" else 0,
+                       "speaker":r.get("speaker",extract_spk(key))}
+            lst.append(key)
+    return meta,lst
 
-def getASVSpoof2021_list_new(base):
-    meta, lst = {}, []
-    proto = os.path.join(base, "ASVspoof2021.LA.cm.eval.trl_updated.txt")
-    with open(proto) as f:
-        for line in f:
-            _, uid, spk, _, lab = line.strip().split()
-            key = os.path.join(base, "flac", uid+".flac")
-            meta[key] = {"label": 1 if lab=="bonafide" else 0, "speaker": spk}; lst.append(key)
-    return meta, lst
+# ---- helper: use PART-ID numeric portion as speaker ----
+
+def _parse_asv(proto,a_root):
+    meta,lst={},[]
+    with open(proto) as fh:
+        for line in fh:
+            p=line.strip().split();
+            if len(p)!=5: continue
+            part,uid,_,_,lab=p
+            # part e.g. LA_0079 -> numeric 79 (keep leading zeros removed)
+            print("part ",part)
+            spk=str(int(part.split('_')[1]))
+            wav=os.path.join(a_root,uid+".flac")
+            meta[wav]={"label":1 if lab=="bonafide" else 0,"speaker":spk}; lst.append(wav)
+    return meta,lst
+
+# ASVspoof 2019
 
 def getASVSpoof2019_list_new(base):
-    meta, lst = {}, []
-    protocols = [
-        ("ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trl.txt", "ASVspoof2019_LA_train/flac"),
-        ("ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.val.trl.txt",   "ASVspoof2019_LA_val/flac"),
-        ("ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.test.trl.txt",  "ASVspoof2019_LA_test/flac")]
-    for proto, folder in protocols:
-        with open(os.path.join(base, proto)) as f:
-            for line in f:
-                _, uid, spk, _, lab = line.strip().split()
-                key = os.path.join(base, folder, uid+".flac")
-                meta[key] = {"label": 1 if lab=="bonafide" else 0, "speaker": spk}; lst.append(key)
-    return meta, lst
+    meta,lst={},[]
+    specs=[
+        ("ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.train.trl.txt","ASVspoof2019_LA_train/flac"),
+        ("ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.val.trl.txt","ASVspoof2019_LA_val/flac"),
+        ("ASVspoof2019_LA_cm_protocols/ASVspoof2019.LA.cm.test.trl.txt","ASVspoof2019_LA_test/flac")]
+    for proto_rel,a_rel in specs:
+        pth=os.path.join(base,proto_rel)
+        if not os.path.exists(pth): continue
+        m,ids=_parse_asv(pth,os.path.join(base,a_rel))
+        meta.update(m); lst.extend(ids)
+    return meta,lst
+
+# ASVspoof 2021
+
+def getASVSpoof2021_list_new(base):
+    meta,lst={},[]
+    proto_root=(os.path.join(base,"ASVspoof2021_LA_cm_protocols") if os.path.isdir(os.path.join(base,"ASVspoof2021_LA_cm_protocols")) else base)
+    for f in os.listdir(proto_root):
+        if not f.endswith(".txt"): continue
+        m,ids=_parse_asv(os.path.join(proto_root,f), os.path.join(base,"flac"))
+        meta.update(m); lst.extend(ids)
+    return meta,lst
+
+# LJSpeech
 
 def genLJSpeech_list_new(base):
-    meta, lst = {}, []
-    for f in os.listdir(os.path.join(base, "wavs")):
-        key = os.path.join(base, "wavs", f)
-        meta[key] = {"label": 1, "speaker": "LJ"}; lst.append(key)
-    return meta, lst
+    meta,lst={},[]
+    for f in os.listdir(os.path.join(base,"wavs")):
+        key=os.path.join(base,"wavs",f)
+        meta[key]={"label":1,"speaker":"LJ"}; lst.append(key)
+    return meta,lst
+
+# WaveFake
 
 def genWavefake_list_new(base):
-    folders = ["ljspeech_melgan", "ljspeech_parallel_wavegan", "ljspeech_multi_band_melgan",
-               "ljspeech_full_band_melgan", "ljspeech_waveglow", "ljspeech_hifiGAN"]
-    meta, lst = {}, []
+    folders=["ljspeech_melgan","ljspeech_parallel_wavegan","ljspeech_multi_band_melgan","ljspeech_full_band_melgan","ljspeech_waveglow","ljspeech_hifiGAN"]
+    meta,lst={},[]
     for fld in folders:
-        for f in os.listdir(os.path.join(base, fld)):
-            key = os.path.join(base, fld, f)
-            spk = extract_spk(f)  # p225
-            meta[key] = {"label": 0, "speaker": spk}; lst.append(key)
-    return meta, lst
+        for f in os.listdir(os.path.join(base,fld)):
+            key=os.path.join(base,fld,f)
+            meta[key]={"label":0,"speaker":extract_spk(f)}; lst.append(key)
+    return meta,lst
+
+# Fake-or-Real variants
 
 def gen_for_norm_list_new(base):
-    def read_split(split):
-        meta, ids = {}, []
-        for cat in ["fake", "real"]:
-            folder = os.path.join(base, split, cat)
-            for f in os.listdir(folder):
-                key = os.path.join(folder, f)
-                lab = 0 if cat=="fake" else 1
-                spk = extract_spk(f)
-                meta[key] = {"label": lab, "speaker": spk}; ids.append(key)
-        return meta, ids
-    tr_meta,tr_ids = read_split("training")
-    va_meta,va_ids = read_split("validation")
-    te_meta,te_ids = read_split("testing")
-    return tr_ids,tr_meta,va_ids,va_meta,te_ids,te_meta
+    def read(split):
+        m,ids={},[]
+        for cat in ["fake","real"]:
+            fold=os.path.join(base,split,cat)
+            for f in os.listdir(fold):
+                key=os.path.join(fold,f)
+                m[key]={"label":0 if cat=="fake" else 1,"speaker":extract_spk(f)}; ids.append(key)
+        return m,ids
+    tr_m,tr_ids=read("training"); va_m,va_ids=read("validation"); te_m,te_ids=read("testing")
+    return tr_ids,tr_m,va_ids,va_m,te_ids,te_m
+
+# split_dict, combine_all_dicts, gen_combined_list, loaders ... (unchanged)
+
 
 # ------------------------------------------------------------
 # split_dict updated to read meta[label]
 # ------------------------------------------------------------
 
-def split_dict(meta, tr=0.1, va=0.1, te=0.8, seed=None):
+def split_dict(meta, tr=0.01, va=0.1, te=0.89, seed=None):
     if seed is not None:
         random.seed(seed)
     pos = [k for k,v in meta.items() if v["label"]==1]
