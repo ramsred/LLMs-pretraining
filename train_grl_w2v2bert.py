@@ -1,9 +1,9 @@
-# ------------------------------------------------------------
-# Train Wav2Vec2BERT + GRL speaker adversary
-#   * label: 1 = bonafide / human / real
-#   * label: 0 = spoof / synthetic / fake
-#   * GRL speaker-loss computed ONLY on label == 1
-# ------------------------------------------------------------
+# ============================================================
+# Wav2Vec2-BERT  •  Spoof vs Real
+#   Optional Gradient-Reversal (GRL) speaker adversary
+#   Optional Speaker-Null projection
+# ============================================================
+
 import argparse, os, random
 from datetime import datetime
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
@@ -18,25 +18,60 @@ from data_utils_speaker import (
 )
 
 # ---------------- Device ----------------
-device = "cuda" if torch.cuda.is_available() else (
-         "mps"  if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
-         else "cpu")
+device = ("cuda" if torch.cuda.is_available() else
+          "mps"  if getattr(torch.backends, "mps", None)
+                    and torch.backends.mps.is_available() else "cpu")
 
-# ---------------- GRL -------------------
+# ---------------- GRL op ----------------
 class GradReverse(Function):
     @staticmethod
-    def forward(ctx, x, lamb): ctx.lamb = lamb; return x.view_as(x)
+    def forward(ctx, x, lamb): ctx.lamb = lamb; return x
     @staticmethod
-    def backward(ctx, g):       return -ctx.lamb * g, None
+    def backward(ctx, g):      return -ctx.lamb * g, None
 def grad_reverse(x, lamb=0.5): return GradReverse.apply(x, lamb)
 
-# ---------------- Wrapper ----------------
-class Wav2Vec2BERT_GRL(nn.Module):
-    def __init__(self, base: Wav2Vec2BERT, n_spk: int, lamb: float = .5):
-        super().__init__(); self.base = base; self.lamb = lamb
-        self.spk_head = nn.Linear(base.config.hidden_size, n_spk)
+# ---------------- Speaker MLP ----------—
+class SpkHead(nn.Module):
+    """768 → 512 → 256 → n_spk"""
+    def __init__(self, dim, n_spk):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, 512), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(256, n_spk)
+        )
+    def forward(self, x): return self.net(x)
 
-    def forward(self, feats):
+# ---------------- Wrapper ---------------
+class WAV2V_PRIV(nn.Module):
+    """
+    * base encoder + spoof classifier (always on)
+    * optional GRL speaker adversary     (--use_grl)
+    * optional Speaker-Null projection   (--null_rank > 0)
+    """
+    def __init__(self, base: Wav2Vec2BERT, n_spk: int,
+                 use_grl: bool, lamb: float, null_rank: int):
+        super().__init__()
+        self.base = base
+        self.use_grl   = use_grl
+        self.lamb      = lamb
+        self.null_rank = null_rank
+
+        dim = base.config.hidden_size
+        if use_grl:
+            self.spk_head = SpkHead(dim, n_spk)
+
+        if null_rank > 0:
+            self.register_buffer("U", torch.zeros(dim, null_rank))
+            self.U_valid = False  # updated after epoch-0
+
+    # ---------- helper ----------
+    def apply_null(self, emb):
+        if self.null_rank > 0 and self.U_valid:
+            return emb - emb @ self.U @ self.U.T
+        return emb
+
+    def forward(self, feats, ret_emb=False):
         out = self.base.wav2vec2bert(
             feats["input_features"],
             attention_mask=feats.get("attention_mask"),
@@ -44,9 +79,43 @@ class Wav2Vec2BERT_GRL(nn.Module):
             return_dict=True,
         )
         emb = self.base.merged_strategy(out.last_hidden_state)
+        emb = self.apply_null(emb)
+
         rf_logits = self.base.classifier(emb)
-        spk_logits = self.spk_head(grad_reverse(emb, self.lamb))
+
+        if self.use_grl:
+            spk_logits = self.spk_head(grad_reverse(emb, self.lamb))
+        else:
+            spk_logits = None
+
+        if ret_emb:
+            return rf_logits, spk_logits, emb
         return rf_logits, spk_logits
+
+# ---------------- null-space builder ----------------
+@torch.no_grad()
+def update_null(model: WAV2V_PRIV, loader, fx, sr, rank):
+    feats, spks = [], []
+    for wav, y, spk, _ in loader:
+        mask = y == 1
+        if not mask.any(): continue
+        w = fx(wav[mask].to(torch.float32).numpy(), sampling_rate=sr,
+               return_attention_mask=True, padding_value=0, return_tensors="pt").to(device)
+        h = model.base.wav2vec2bert(w.input_features,
+                                    attention_mask=w.attention_mask,
+                                    output_hidden_states=True).last_hidden_state
+        e = model.base.merged_strategy(h)
+        feats.append(e.cpu()); spks.extend(spk[mask].tolist())
+    X = torch.cat(feats)                      # N×D
+    spks = torch.tensor(spks)
+    mu_all = X.mean(0, keepdim=True)
+    C = torch.zeros(X.size(1), X.size(1))
+    for s in spks.unique():
+        xs = X[spks == s]
+        mu_s = xs.mean(0, keepdim=True)
+        C += (mu_s - mu_all).T @ (mu_s - mu_all)
+    _, V = torch.linalg.eigh(C)
+    model.U.copy_(V[:, -rank:]); model.U_valid = True
 
 # ---------------- Main ------------------
 def main(a):
@@ -55,32 +124,45 @@ def main(a):
 
     tr_loader, val_loader, _ = get_combined_loader(a.data_path, a.seed, a.batch_size)
     n_spk = len(AudioDataset.spk2idx)
+    print("n_speakers =", n_spk)
 
-    base = Wav2Vec2BERT("facebook/w2v-bert-2.0").to(device)
-    model = Wav2Vec2BERT_GRL(base, n_spk, lamb=a.lambda_adv).to(device)
-    fx = AutoFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0"); sr = 16000
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
+    base  = Wav2Vec2BERT("facebook/w2v-bert-2.0").to(device)
+    model = WAV2V_PRIV(base, n_spk,
+                       use_grl=a.use_grl,
+                       lamb=a.lambda_adv,
+                       null_rank=a.null_rank).to(device)
+    fx  = AutoFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+    sr  = 16000
+
+    # ---- two LR groups only if GRL is on ----
+    param_groups = [{"params": [p for n,p in model.named_parameters()
+                                 if not n.startswith("spk_head.")],
+                     "lr": a.lr}]
+    if a.use_grl:
+        param_groups.append({"params": model.spk_head.parameters(),
+                             "lr": a.lr_spk})
+    opt = torch.optim.AdamW(param_groups, weight_decay=a.weight_decay)
 
     # ------------- training -------------
     if a.train:
         model.train()
         for ep in range(a.epochs):
             running, pr, gt = 0.0, [], []
-            for step,(wav,y,spk,_) in enumerate(tqdm(tr_loader,desc=f"ep{ep}")):
-                assert y.max()<=1 and y.min()>=0, "Labels must be 0 (spoof) or 1 (bonafide)"
+            for step,(wav,y,spk,_) in enumerate(tqdm(tr_loader, desc=f"ep{ep}")):
                 feats = fx(wav.to(torch.float32).numpy(), sampling_rate=sr,
                            return_attention_mask=True, padding_value=0,
                            return_tensors="pt")
                 feats = {k:v.to(device) for k,v in feats.items()}
                 y, spk = y.to(device), spk.to(device)
 
-                rf_logits, spk_logits = model(feats)
-                loss_rf  = F.cross_entropy(rf_logits, y)
+                rf_logits, spk_logits = model(feats)[:2]
+                loss_rf = F.cross_entropy(rf_logits, y)
 
-                # ---- speaker loss only for real clips ----
-                mask = y == 1
-                loss_spk = F.cross_entropy(spk_logits[mask], spk[mask]) if mask.any() \
-                           else torch.tensor(0., device=device)
+                loss_spk = torch.tensor(0., device=device)
+                if a.use_grl:
+                    mask = y == 1
+                    if mask.any():
+                        loss_spk = F.cross_entropy(spk_logits[mask], spk[mask])
 
                 loss = loss_rf + loss_spk
                 opt.zero_grad(); loss.backward(); opt.step()
@@ -92,36 +174,48 @@ def main(a):
                 if (step+1) % a.eval_steps == 0:
                     run_validation(model.base, fx, val_loader, sr); model.train()
 
-            print(f"ep{ep}  loss={running/(step+1):.4f}  AUROC={roc_auc_score(gt,pr):.4f}")
-            eval_acc, eval_auroc, eval_eer = run_validation(model.base, fx, val_loader, sr)
-            ck = f"{a.dataset_name}_grl_ep{ep}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
+            au = roc_auc_score(gt, pr)
+            print(f"ep{ep}  loss={running/(step+1):.4f}  AUROC={au:.4f}")
+            
+
+            # build/update null space
+            if a.null_rank > 0:
+                update_null(model, tr_loader, fx, sr, a.null_rank)
+                print(f"  ↪ updated speaker-null (rank {a.null_rank})")
+            run_validation(model.base, fx, val_loader, sr)
+            ck = f"{a.dataset_name}_ep{ep}_{datetime.now():%Y%m%d_%H%M%S}.pth"
             torch.save(model.state_dict(), os.path.join(a.output_dir, ck))
 
     # ------------- testing --------------
     if a.test:
-        if not a.checkpoint: raise ValueError("--checkpoint required when --test")
+        if not a.checkpoint: raise ValueError("--checkpoint required for --test")
         test_loader = get_test_loader(a.data_path, a.seed, a.batch_size)
         model.load_state_dict(torch.load(os.path.join(a.output_dir, a.checkpoint),
                                          map_location=device), strict=False)
         model.eval(); run_validation(model.base, fx, test_loader, sr)
 
-
-
 # ---------------- CLI -------------------
 if __name__ == "__main__":
-    p = argparse.ArgumentParser("W2v-BERT with GRL (real speakers only)")
+    p = argparse.ArgumentParser("W2v-BERT  +  GRL / Speaker-Null toggles")
     p.add_argument("--data_path", nargs="+", required=True)
     p.add_argument("--output_dir", default="./ckpt")
     p.add_argument("--train", type=bool, default=False, help="Flag to run training")
-    p.add_argument("--test", type=bool, default=False, help="Flag to run training")
+    p.add_argument("--test", type=bool, default=False, help="Flag to run test")
     p.add_argument("--checkpoint", default="")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--lr_spk", type=float, default=5e-5,
+                   help="LR for speaker head (used only if --use_grl)")
     p.add_argument("--weight_decay", type=float, default=5e-5)
     p.add_argument("--eval_steps", type=int, default=500)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--dataset_name", default="dataset")
-    p.add_argument("--lambda_adv", type=float, default=0.5)
-    args = p.parse_args(); main(args)
+    p.add_argument("--lambda_adv", type=float, default=0.5,
+                   help="GRL λ (ignored if --use_grl is False)")
+    # -------- toggles --------
 
+    p.add_argument("--use_grl", type=bool, default=False, help="Enable Gradient-Reversal speaker adversary")
+    p.add_argument("--null_rank", type=int, default=0,
+                   help="Rank of speaker-null projection (0 = off)")
+    args = p.parse_args(); main(args)
