@@ -28,6 +28,7 @@ def seed_worker(w_id):
     seed = torch.initial_seed() % 2**32
     random.seed(seed); np.random.seed(seed)
 
+
 # ---------------- Eval metrics -------------------
 
 def compute_det_curve(tar, non):
@@ -75,6 +76,7 @@ class AudioDataset(Dataset):
     spk2idx={}
     def __init__(self, ids, meta, cut=64000):
         self.ids, self.meta, self.cut = ids, meta, cut
+      
         for k in ids:
             spk = meta[k]["speaker"]
             if spk not in AudioDataset.spk2idx:
@@ -82,7 +84,9 @@ class AudioDataset(Dataset):
     def __len__(self): return len(self.ids)
     def __getitem__(self, idx):
         key=self.ids[idx]
-        x,_=librosa.load(key,sr=8000); x=pad(x,self.cut)
+        x,_=librosa.load(key,sr=8000)
+        # x=librosa.effects.pitch_shift(x, sr=8000, n_steps=8)
+        x=pad(x,self.cut)
         y=self.meta[key]["label"]
         spk=AudioDataset.spk2idx[self.meta[key]["speaker"]]
         return x,y,spk,key
@@ -110,7 +114,7 @@ def _parse_asv(proto,a_root):
             if len(p)!=5: continue
             part,uid,_,_,lab=p
             # part e.g. LA_0079 -> numeric 79 (keep leading zeros removed)
-            print("part ",part)
+            # print("part ",part,"proto:",proto)
             spk=str(int(part.split('_')[1]))
             wav=os.path.join(a_root,uid+".flac")
             meta[wav]={"label":1 if lab=="bonafide" else 0,"speaker":spk}; lst.append(wav)
@@ -135,10 +139,13 @@ def getASVSpoof2019_list_new(base):
 
 def getASVSpoof2021_list_new(base):
     meta,lst={},[]
-    proto_root=(os.path.join(base,"ASVspoof2021_LA_cm_protocols") if os.path.isdir(os.path.join(base,"ASVspoof2021_LA_cm_protocols")) else base)
-    for f in os.listdir(proto_root):
-        if not f.endswith(".txt"): continue
-        m,ids=_parse_asv(os.path.join(proto_root,f), os.path.join(base,"flac"))
+    specs=[
+        ("ASVspoof2021.LA.cm.eval.trl_updated.txt","flac/")]
+    for proto_rel,a_rel in specs:
+        pth=os.path.join(base,proto_rel)
+
+        if not os.path.exists(pth): continue
+        m,ids=_parse_asv(pth,os.path.join(base,a_rel))
         meta.update(m); lst.extend(ids)
     return meta,lst
 
@@ -183,7 +190,7 @@ def gen_for_norm_list_new(base):
 # split_dict updated to read meta[label]
 # ------------------------------------------------------------
 
-def split_dict(meta, tr=0.01, va=0.1, te=0.89, seed=None):
+def split_dict(meta, tr=0.70, va=0.1, te=0.20, seed=None):
     if seed is not None:
         random.seed(seed)
     pos = [k for k,v in meta.items() if v["label"]==1]
@@ -287,10 +294,14 @@ def get_test_loader(data_paths, seed: int, batch_size: int):
         worker_init_fn=seed_worker,
         generator=gen,
     )
+
+
 def get_combined_loader(paths, seed, bs):
     tr_lab,tr_ids,va_lab,va_ids,te_lab,te_ids = gen_combined_list(paths, seed)
     g = torch.Generator().manual_seed(seed)
     tr_ds = AudioDataset(tr_ids, tr_lab); va_ds = AudioDataset(va_ids, va_lab); te_ds = AudioDataset(te_ids, te_lab)
-    tr_lo = DataLoader(tr_ds, bs, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=g)
-    va_lo = DataLoader(va_ds, bs, shuffle=True, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+    tr_lo = DataLoader(tr_ds, bs, shuffle=True, pin_memory=True, num_workers=16,worker_init_fn=seed_worker, generator=g)
+    va_lo = DataLoader(va_ds, bs, shuffle=True, pin_memory=True,num_workers=16, worker_init_fn=seed_worker, generator=g)
     return tr_lo, va_lo, te_ds
+
+
